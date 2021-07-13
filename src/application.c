@@ -9,7 +9,7 @@
 /*
 TOWER configuration:
     CORE module NR (temperature, acceleration, security chip)
-    LCD module - LCD, 2x button, 6x RGB mini LED, gesture & proximity sensor 
+    LCD module - LCD, 2x button, 6x RGB mini LED, gesture & proximity sensor
     LoRa module
     CO2 module
     H  umidity tag
@@ -43,7 +43,7 @@ TWR_DATA_STREAM_FLOAT_BUFFER(sm_voltage_buffer, 8)
 TWR_DATA_STREAM_FLOAT_BUFFER(sm_temperature_buffer, (SEND_DATA_INTERVAL / MEASURE_INTERVAL))
 TWR_DATA_STREAM_FLOAT_BUFFER(sm_humidity_buffer, (SEND_DATA_INTERVAL / MEASURE_INTERVAL))
 TWR_DATA_STREAM_FLOAT_BUFFER(sm_co2_buffer, (SEND_DATA_INTERVAL / MEASURE_INTERVAL_CO2))
-TWR_DATA_STREAM_FLOAT_BUFFER(sm_voc_buffer, (SEND_DATA_INTERVAL / MEASURE_INTERVAL_VOC))
+TWR_DATA_STREAM_INT_BUFFER(sm_voc_buffer, (SEND_DATA_INTERVAL / MEASURE_INTERVAL_VOC))
 TWR_DATA_STREAM_INT_BUFFER(sm_orientation_buffer, 3)
 
 twr_data_stream_t sm_voltage;
@@ -140,7 +140,8 @@ void voc_tag_event_handler(twr_tag_voc_lp_t *self, twr_tag_voc_lp_event_t event,
         twr_log_debug("VOC MODULE get ppb");
         if (twr_tag_voc_lp_get_tvoc_ppb(self, &value))
         {
-            twr_data_stream_feed(&sm_voc, &value);
+            int retyped_value = (int)value;
+            twr_data_stream_feed(&sm_voc, &retyped_value);
             twr_log_debug("VOC MODULE: VOC: %i ppb", value);
         }
         else
