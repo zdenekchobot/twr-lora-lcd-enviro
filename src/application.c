@@ -296,9 +296,7 @@ void application_init(void)
 {
     // Initialize logging
     twr_log_init(TWR_LOG_LEVEL_DUMP, TWR_LOG_TIMESTAMP_ABS);
-    twr_log_debug("Debug log started");
-
-
+ 
     twr_data_stream_init(&sm_voltage, 1, &sm_voltage_buffer);
     twr_data_stream_init(&sm_temperature, 1, &sm_temperature_buffer);
     twr_data_stream_init(&sm_humidity, 1, &sm_humidity_buffer);
@@ -337,11 +335,11 @@ void application_init(void)
     twr_tag_humidity_set_update_interval(&humi, MEASURE_INTERVAL);
 
     // Initialize VOC tag
-    twr_log_debug("VOC_LP sensor init started");
+    twr_log_debug("VOC_LP tag init started");
     twr_tag_voc_lp_init(&voc_tag, TWR_I2C_I2C0);
     twr_tag_voc_lp_set_event_handler(&voc_tag, voc_tag_event_handler, NULL);
     twr_tag_voc_lp_set_update_interval(&voc_tag, MEASURE_INTERVAL_VOC);
-    twr_log_debug("VOC_LP sensor init finished");
+    twr_log_debug("VOC_LP tag init finished");
 
     // Initialize battery
     twr_module_battery_init();
