@@ -1,11 +1,3 @@
-#include <application.h>
-#include <at.h>
-
-#define SEND_DATA_INTERVAL (15 * 60 * 1000)
-#define MEASURE_INTERVAL (15 * 1000)
-#define MEASURE_INTERVAL_CO2 (15 * 1000)
-#define MEASURE_INTERVAL_VOC (15 * 1000)
-
 /*
 TOWER configuration:
     CORE module NR (temperature, acceleration, security chip)
@@ -16,44 +8,107 @@ TOWER configuration:
     VOC-LP tag
     Mini battery module
 */
+#include <application.h>
+#include <at.h>
+
+#define SEND_DATA_INTERVAL (10 * 60 * 1000)
+#define HUMIDITY_UPDATE_INTERVAL (1 * 60 * 1000)
+#define CO2_UPDATE_INTERVAL (2 * 60 * 1000)
+#define TVOC_UPDATE_INTERVAL (5 * 60 * 1000)
+#define BATTERY_UPDATE_INTERVAL (5 * 60 * 1000)
+
+#define CO2_CALIBRATION_DELAY (2 * 60 * 1000)
+#define CO2_CALIBRATION_INTERVAL (1 * 60 * 1000)
+#define CO2_UPDATE_SERVICE_INTERVAL (1 * 60 * 1000)
+
+#define MAX_PAGE_INDEX 2
+
+#define PAGE_INDEX_MENU -1
 
 // LED instance
 twr_led_t ledr;
 twr_led_t ledg;
 twr_led_t ledb;
-// Button instance
+
+/* Button instance
 twr_button_t button_left;
 twr_button_t button_right;
+*/
+
 // Lora instance
 twr_cmwx1zzabz_t lora;
-// Accelerometer instance
+
+/* Accelerometer instance
 twr_lis2dh12_t lis2dh12;
 twr_dice_t dice;
 twr_dice_face_t dice_face = TWR_DICE_FACE_1;
-// Thermometer instance
+*/
+
+/* On-board thermometer instance
 twr_tmp112_t tmp112;
+*/
+
 // Humidity tag instance
 twr_tag_humidity_t humi;
+
 //VOC tag instance
 twr_tag_voc_lp_t voc_tag;
+
 // GFX pointer
 twr_gfx_t *pgfx;
 
-TWR_DATA_STREAM_FLOAT_BUFFER(sm_voltage_buffer, 8)
-TWR_DATA_STREAM_FLOAT_BUFFER(sm_temperature_buffer, (SEND_DATA_INTERVAL / MEASURE_INTERVAL))
-TWR_DATA_STREAM_FLOAT_BUFFER(sm_humidity_buffer, (SEND_DATA_INTERVAL / MEASURE_INTERVAL))
-TWR_DATA_STREAM_FLOAT_BUFFER(sm_co2_buffer, (SEND_DATA_INTERVAL / MEASURE_INTERVAL_CO2))
-TWR_DATA_STREAM_INT_BUFFER(sm_voc_buffer, (SEND_DATA_INTERVAL / MEASURE_INTERVAL_VOC))
-TWR_DATA_STREAM_INT_BUFFER(sm_orientation_buffer, 3)
+static struct
+{
+    float_t temperature;
+    float_t humidity;
+    float_t co2;
+    float_t tvoc;
+    float_t battery_voltage;
+    float_t battery_pct;
+
+} values;
+
+static const struct
+{
+    char *name0;
+    char *format0;
+    float_t *value0;
+    char *unit0;
+    char *name1;
+    char *format1;
+    float_t *value1;
+    char *unit1;
+
+} pages[] = {
+    {"Temperature   ", "%.1f", &values.temperature, "\xb0"
+                                                    "C",
+     "Humidity      ", "%.0f", &values.humidity, "%"},
+    {"CO2           ", "%.0f", &values.co2, "ppm",
+     "TVOC          ", "%.0f", &values.tvoc, "ppb"},
+    {"Battery       ", "%.2f", &values.battery_voltage, "V",
+     "Battery       ", "%.0f", &values.battery_pct, "%"},
+};
+
+static int page_index = 0;
+static int menu_item = 0;
+bool active_mode = true;
+int calibration_counter;
+
+TWR_DATA_STREAM_FLOAT_BUFFER(sm_voltage_buffer, SEND_DATA_INTERVAL / BATTERY_UPDATE_INTERVAL)
+TWR_DATA_STREAM_FLOAT_BUFFER(sm_percentage_buffer, SEND_DATA_INTERVAL / BATTERY_UPDATE_INTERVAL)
+TWR_DATA_STREAM_FLOAT_BUFFER(sm_temperature_buffer, (SEND_DATA_INTERVAL / HUMIDITY_UPDATE_INTERVAL))
+TWR_DATA_STREAM_FLOAT_BUFFER(sm_humidity_buffer, (SEND_DATA_INTERVAL / HUMIDITY_UPDATE_INTERVAL))
+TWR_DATA_STREAM_FLOAT_BUFFER(sm_co2_buffer, (SEND_DATA_INTERVAL / CO2_UPDATE_INTERVAL))
+TWR_DATA_STREAM_FLOAT_BUFFER(sm_voc_buffer, (SEND_DATA_INTERVAL / TVOC_UPDATE_INTERVAL))
 
 twr_data_stream_t sm_voltage;
+twr_data_stream_t sm_percentage;
 twr_data_stream_t sm_temperature;
 twr_data_stream_t sm_humidity;
 twr_data_stream_t sm_co2;
 twr_data_stream_t sm_voc;
-twr_data_stream_t sm_orientation;
 
-twr_scheduler_task_id_t battery_measure_task_id;
+twr_scheduler_task_id_t calibration_task_id;
 
 enum
 {
@@ -64,7 +119,105 @@ enum
 
 } header = HEADER_BOOT;
 
-void button_event_handler(twr_button_t *self, twr_button_event_t event, void *event_param)
+void calibration_task(void *param);
+
+void calibration_start()
+{
+    calibration_counter = 32;
+
+    twr_led_set_mode(&ledb, TWR_LED_MODE_BLINK_SLOW);
+    calibration_task_id = twr_scheduler_register(calibration_task, NULL, twr_tick_get() + CO2_CALIBRATION_DELAY);
+    twr_log_debug("Start CO2 calibration");
+}
+
+void calibration_stop()
+{
+    twr_led_set_mode(&ledb, TWR_LED_MODE_OFF);
+    twr_scheduler_unregister(calibration_task_id);
+    calibration_task_id = 0;
+
+    twr_module_co2_set_update_interval(CO2_UPDATE_INTERVAL);
+    twr_log_debug("Stop CO2 calibration");
+}
+
+void calibration_task(void *param)
+{
+    (void)param;
+
+    twr_led_set_mode(&ledb, TWR_LED_MODE_BLINK_FAST);
+
+    twr_log_debug("CO2 calibration %i", calibration_counter);
+
+    twr_module_co2_set_update_interval(CO2_UPDATE_SERVICE_INTERVAL);
+    twr_module_co2_calibration(TWR_LP8_CALIBRATION_BACKGROUND_FILTERED);
+
+    calibration_counter--;
+
+    if (calibration_counter == 0)
+    {
+        calibration_stop();
+    }
+
+    twr_scheduler_plan_current_relative(CO2_CALIBRATION_INTERVAL);
+}
+
+static void lcd_page_render()
+{
+    int w;
+    char str[32];
+
+    twr_system_pll_enable();
+
+    twr_gfx_clear(pgfx);
+
+    if ((page_index <= MAX_PAGE_INDEX) && (page_index != PAGE_INDEX_MENU))
+    {
+        twr_gfx_set_font(pgfx, &twr_font_ubuntu_15);
+        twr_gfx_draw_string(pgfx, 10, 5, pages[page_index].name0, true);
+
+        twr_gfx_set_font(pgfx, &twr_font_ubuntu_28);
+        snprintf(str, sizeof(str), pages[page_index].format0, *pages[page_index].value0);
+        w = twr_gfx_draw_string(pgfx, 25, 25, str, true);
+        twr_gfx_set_font(pgfx, &twr_font_ubuntu_15);
+        w = twr_gfx_draw_string(pgfx, w, 35, pages[page_index].unit0, true);
+
+        twr_gfx_set_font(pgfx, &twr_font_ubuntu_15);
+        twr_gfx_draw_string(pgfx, 10, 55, pages[page_index].name1, true);
+
+        twr_gfx_set_font(pgfx, &twr_font_ubuntu_28);
+        snprintf(str, sizeof(str), pages[page_index].format1, *pages[page_index].value1);
+        w = twr_gfx_draw_string(pgfx, 25, 75, str, true);
+        twr_gfx_set_font(pgfx, &twr_font_ubuntu_15);
+        twr_gfx_draw_string(pgfx, w, 85, pages[page_index].unit1, true);
+    }
+
+    snprintf(str, sizeof(str), "%d/%d", page_index + 1, MAX_PAGE_INDEX + 1);
+    twr_gfx_set_font(pgfx, &twr_font_ubuntu_13);
+    twr_gfx_draw_string(pgfx, 55, 115, str, true);
+
+    twr_system_pll_disable();
+}
+
+void lcd_draw()
+{
+    if (!twr_gfx_display_is_ready(pgfx))
+    {
+        return;
+    }
+
+    if (active_mode)
+    {
+        lcd_page_render();
+    }
+    else
+    {
+        twr_scheduler_plan_current_relative(500);
+    }
+
+    twr_gfx_update(pgfx);
+}
+
+/* void button_event_handler(twr_button_t *self, twr_button_event_t event, void *event_param)
 {
     if (event == TWR_BUTTON_EVENT_CLICK && event_param == 0)
     {
@@ -83,12 +236,98 @@ void button_event_handler(twr_button_t *self, twr_button_event_t event, void *ev
         twr_led_set_mode(&ledr, TWR_LED_MODE_TOGGLE);
     }
 }
+*/
 
 void lcd_event_handler(twr_module_lcd_event_t event, void *event_param)
 {
+    (void)event_param;
+
+    if (event == TWR_MODULE_LCD_EVENT_LEFT_CLICK)
+    {
+        if ((page_index != PAGE_INDEX_MENU))
+        {
+            // Key previous page
+            page_index--;
+            if (page_index < 0)
+            {
+                page_index = MAX_PAGE_INDEX;
+                menu_item = 0;
+            }
+        }
+        else
+        {
+            // Key menu down
+            menu_item++;
+            if (menu_item > 4)
+            {
+                menu_item = 0;
+            }
+        }
+
+        static uint16_t left_event_count = 0;
+        left_event_count++;
+        lcd_draw();
+    }
+    else if (event == TWR_MODULE_LCD_EVENT_BOTH_HOLD)
+    {
+        static int both_hold_event_count = 0;
+        both_hold_event_count++;
+        twr_led_pulse(&ledr, 200);
+        /* active_mode = !active_mode;
+        if (active_mode)
+        {
+            lcd_draw();
+        }
+        else
+        {
+            twr_gfx_clear(pgfx);
+            twr_gfx_update(pgfx);
+        }
+        */
+    }
+    else if (event == TWR_MODULE_LCD_EVENT_RIGHT_CLICK)
+    {
+        if ((page_index != PAGE_INDEX_MENU) || (menu_item == 0))
+        {
+            // Key next page
+            page_index++;
+            if (page_index > MAX_PAGE_INDEX)
+            {
+                page_index = 0;
+            }
+            if (page_index == PAGE_INDEX_MENU)
+            {
+                menu_item = 0;
+            }
+        }
+
+        static uint16_t right_event_count = 0;
+        right_event_count++;
+        lcd_draw();
+    }
+    else if (event == TWR_MODULE_LCD_EVENT_LEFT_HOLD)
+    {
+        static int left_hold_event_count = 0;
+        left_hold_event_count++;
+        twr_led_set_mode(&ledg, TWR_LED_MODE_ON);
+        twr_scheduler_plan_now(0);
+    }
+    else if (event == TWR_MODULE_LCD_EVENT_RIGHT_HOLD)
+    {
+        static int right_hold_event_count = 0;
+        right_hold_event_count++;
+        if (!calibration_task_id)
+        {
+            calibration_start();
+        }
+        else
+        {
+            calibration_stop();
+        }
+    }
 }
 
-void tmp112_event_handler(twr_tmp112_t *self, twr_tmp112_event_t event, void *event_param)
+/* void tmp112_event_handler(twr_tmp112_t *self, twr_tmp112_event_t event, void *event_param)
 {
     float value = NAN;
     if (event == TWR_TMP112_EVENT_UPDATE)
@@ -97,6 +336,7 @@ void tmp112_event_handler(twr_tmp112_t *self, twr_tmp112_event_t event, void *ev
         twr_log_debug("CORE: Temperature: %.1f °C", value);
     }
 }
+*/
 
 void tag_humidity_event_handler(twr_tag_humidity_t *self, twr_tag_humidity_event_t event, void *event_param)
 {
@@ -107,6 +347,8 @@ void tag_humidity_event_handler(twr_tag_humidity_t *self, twr_tag_humidity_event
         if (twr_tag_humidity_get_humidity_percentage(self, &humidity))
         {
             twr_data_stream_feed(&sm_humidity, &humidity);
+            values.humidity = humidity;
+            lcd_draw();
             twr_log_debug("HUMIDITY TAG: Humidity: %.0f %%", humidity);
         }
         else
@@ -117,6 +359,8 @@ void tag_humidity_event_handler(twr_tag_humidity_t *self, twr_tag_humidity_event
         if (twr_tag_humidity_get_temperature_celsius(self, &temperature))
         {
             twr_data_stream_feed(&sm_temperature, &temperature);
+            values.temperature = temperature;
+            lcd_draw();
             twr_log_debug("HUMIDITY TAG: Temperature: %.1f °C", temperature);
         }
         else
@@ -128,28 +372,24 @@ void tag_humidity_event_handler(twr_tag_humidity_t *self, twr_tag_humidity_event
 
 void voc_tag_event_handler(twr_tag_voc_lp_t *self, twr_tag_voc_lp_event_t event, void *event_param)
 {
-    uint16_t value;
-    /*
-    if (twr_tag_voc_lp_measure(self))
-        twr_log_debug("VOC measure OK");
-    else
-        twr_log_debug("VOC measure error");
-    */
+
     if (event == TWR_TAG_VOC_LP_EVENT_UPDATE)
     {
-        twr_log_debug("VOC MODULE get ppb");
+        uint16_t value;
+
         if (twr_tag_voc_lp_get_tvoc_ppb(self, &value))
         {
-            int retyped_value = (int)value;
+            float retyped_value = (float)value;
             twr_data_stream_feed(&sm_voc, &retyped_value);
-            twr_log_debug("VOC MODULE: VOC: %i ppb", value);
+            values.tvoc = value;
+            lcd_draw();
+            twr_log_debug("VOC TAG: TVOC: %i ppb", value);
         }
         else
         {
-            twr_log_debug("VOC MODULE: Invalid VOC value");
+            twr_log_debug("VOC TAG: Invalid TVOC value");
         }
     }
-    // float = twr_tag_voc_lp_set_compensation()
 }
 
 void battery_event_handler(twr_module_battery_event_t event, void *event_param)
@@ -157,14 +397,29 @@ void battery_event_handler(twr_module_battery_event_t event, void *event_param)
     if (event == TWR_MODULE_BATTERY_EVENT_UPDATE)
     {
         float value = NAN;
+        int percentage;
         if (twr_module_battery_get_voltage(&value))
         {
             twr_data_stream_feed(&sm_voltage, &value);
-            twr_log_debug("BATTERY MODULE: Voltage %.1f V", value);
+            twr_log_debug("BATTERY MODULE: Voltage %.2f V", value);
+            values.battery_voltage = value;
+            lcd_draw();
         }
         else
         {
             twr_log_debug("BATTERY MODULE: Invalid voltage value");
+        }
+        if (twr_module_battery_get_charge_level(&percentage))
+        {
+            float retyped_percentage = (float)percentage;
+            twr_data_stream_feed(&sm_percentage, &retyped_percentage);
+            twr_log_debug("BATTERY MODULE: Charge level %i %%", percentage);
+            values.battery_pct = percentage;
+            lcd_draw();
+        }
+        else
+        {
+            twr_log_debug("BATTERY MODULE: Invalid charge level value");
         }
     }
 }
@@ -177,6 +432,8 @@ void co2_module_event_handler(twr_module_co2_event_t event, void *event_param)
         if (twr_module_co2_get_concentration_ppm(&value))
         {
             twr_data_stream_feed(&sm_co2, &value);
+            values.co2 = value;
+            lcd_draw();
             twr_log_debug("CO2 MODULE: CO2: %.1f ppm", value);
         }
         else
@@ -186,7 +443,7 @@ void co2_module_event_handler(twr_module_co2_event_t event, void *event_param)
     }
 }
 
-void lis2dh12_event_handler(twr_lis2dh12_t *self, twr_lis2dh12_event_t event, void *event_param)
+/* void lis2dh12_event_handler(twr_lis2dh12_t *self, twr_lis2dh12_event_t event, void *event_param)
 {
     if (event == TWR_LIS2DH12_EVENT_UPDATE)
     {
@@ -202,34 +459,35 @@ void lis2dh12_event_handler(twr_lis2dh12_t *self, twr_lis2dh12_event_t event, vo
         }
     }
 }
+*/
 
-void battery_measure_task(void *param)
+/* void battery_measure_task(void *param)
 {
     if (!twr_module_battery_measure())
     {
         twr_scheduler_plan_current_now();
     }
 }
+*/
 
 void lora_callback(twr_cmwx1zzabz_t *self, twr_cmwx1zzabz_event_t event, void *event_param)
 {
     if (event == TWR_CMWX1ZZABZ_EVENT_ERROR)
     {
-        twr_led_set_mode(&ledg, TWR_LED_MODE_BLINK_FAST);
+        twr_led_set_mode(&ledr, TWR_LED_MODE_BLINK_FAST);
     }
     else if (event == TWR_CMWX1ZZABZ_EVENT_SEND_MESSAGE_START)
     {
-        twr_led_set_mode(&ledg, TWR_LED_MODE_ON);
-
-        twr_scheduler_plan_relative(battery_measure_task_id, 20);
+        // twr_led_set_mode(&ledg, TWR_LED_MODE_ON);
     }
     else if (event == TWR_CMWX1ZZABZ_EVENT_SEND_MESSAGE_DONE)
     {
+        twr_led_set_mode(&ledr, TWR_LED_MODE_OFF);
         twr_led_set_mode(&ledg, TWR_LED_MODE_OFF);
     }
     else if (event == TWR_CMWX1ZZABZ_EVENT_READY)
     {
-        twr_led_set_mode(&ledg, TWR_LED_MODE_OFF);
+        twr_led_set_mode(&ledr, TWR_LED_MODE_OFF);
     }
     else if (event == TWR_CMWX1ZZABZ_EVENT_JOIN_SUCCESS)
     {
@@ -258,7 +516,8 @@ bool at_status(void)
         const char *name;
         int precision;
     } values[] = {
-        {&sm_voltage, "Voltage", 1},
+        {&sm_voltage, "Voltage", 2},
+        {&sm_percentage, "Charge level", 0},
         {&sm_temperature, "Temperature", 1},
         {&sm_humidity, "Humidity", 1},
         {&sm_co2, "CO2", 1},
@@ -275,11 +534,11 @@ bool at_status(void)
         }
         else
         {
-            twr_atci_printf("$STATUS: \"%s\",\n", values[i].name);
+            twr_atci_printf("$STATUS: \"%s\", -\n", values[i].name);
         }
     }
 
-    int orientation;
+    /* int orientation;
 
     if (twr_data_stream_get_median(&sm_orientation, &orientation))
     {
@@ -289,6 +548,7 @@ bool at_status(void)
     {
         twr_atci_printf("$STATUS: \"Orientation\",\n", orientation);
     }
+    */
 
     return true;
 }
@@ -297,14 +557,13 @@ void application_init(void)
 {
     // Initialize logging
     twr_log_init(TWR_LOG_LEVEL_DUMP, TWR_LOG_TIMESTAMP_ABS);
- 
+
     twr_data_stream_init(&sm_voltage, 1, &sm_voltage_buffer);
+    twr_data_stream_init(&sm_percentage, 1, &sm_percentage_buffer);
     twr_data_stream_init(&sm_temperature, 1, &sm_temperature_buffer);
     twr_data_stream_init(&sm_humidity, 1, &sm_humidity_buffer);
     twr_data_stream_init(&sm_co2, 1, &sm_co2_buffer);
     twr_data_stream_init(&sm_voc, 1, &sm_voc_buffer);
-    twr_data_stream_init(&sm_orientation, 1, &sm_orientation_buffer);
-
 
     // Initialize LED
     const twr_led_driver_t *driver = twr_module_lcd_get_led_driver();
@@ -313,57 +572,60 @@ void application_init(void)
     twr_led_init_virtual(&ledb, TWR_MODULE_LCD_LED_BLUE, driver, 1);
     // twr_led_set_mode(&led, TWR_LED_MODE_ON);
 
-    // Initialize button
+    /* Initialize button
     const twr_button_driver_t *lcdButtonDriver = twr_module_lcd_get_button_driver();
     twr_button_init_virtual(&button_left, 0, lcdButtonDriver, 0);
     twr_button_init_virtual(&button_right, 1, lcdButtonDriver, 0);
     twr_button_set_event_handler(&button_left, button_event_handler, (int *)0);
     twr_button_set_event_handler(&button_right, button_event_handler, (int *)1);
+    */
 
     // Initialize LCD module
     twr_module_lcd_init();
     twr_module_lcd_set_event_handler(lcd_event_handler, NULL);
+    twr_module_lcd_set_button_hold_time(1000);
     pgfx = twr_module_lcd_get_gfx();
 
-    // Initialize TMP112 - thermometer on Core board
+    /* Initialize TMP112 - thermometer on Core board
     twr_tmp112_init(&tmp112, TWR_I2C_I2C0, 0x49);
-    // twr_tmp112_set_update_interval(&tmp112, MEASURE_INTERVAL);
+    twr_tmp112_set_update_interval(&tmp112, MEASURE_INTERVAL);
     twr_tmp112_set_event_handler(&tmp112, tmp112_event_handler, NULL);
+    */
 
-    //Initialize humidity tag
+    // Initialize humidity tag
     twr_tag_humidity_init(&humi, TWR_TAG_HUMIDITY_REVISION_R3, TWR_I2C_I2C0, 0x40);
     twr_tag_humidity_set_event_handler(&humi, tag_humidity_event_handler, NULL);
-    twr_tag_humidity_set_update_interval(&humi, MEASURE_INTERVAL);
+    twr_tag_humidity_set_update_interval(&humi, HUMIDITY_UPDATE_INTERVAL);
 
     // Initialize VOC tag
-    twr_log_debug("VOC_LP tag init started");
     twr_tag_voc_lp_init(&voc_tag, TWR_I2C_I2C0);
     twr_tag_voc_lp_set_event_handler(&voc_tag, voc_tag_event_handler, NULL);
-    twr_tag_voc_lp_set_update_interval(&voc_tag, MEASURE_INTERVAL_VOC);
-    twr_log_debug("VOC_LP tag init finished");
+    twr_tag_voc_lp_set_update_interval(&voc_tag, TVOC_UPDATE_INTERVAL);
+
+    //Initialize CO2 module
+    twr_module_co2_init();
+    twr_module_co2_set_event_handler(co2_module_event_handler, NULL);
+    twr_module_co2_set_update_interval(CO2_UPDATE_INTERVAL);
 
     // Initialize battery
     twr_module_battery_init();
     twr_module_battery_set_event_handler(battery_event_handler, NULL);
     twr_module_battery_set_threshold_levels((4 * 1.7), (4 * 1.6));
-    battery_measure_task_id = twr_scheduler_register(battery_measure_task, NULL, 2020);
+    twr_module_battery_set_update_interval(BATTERY_UPDATE_INTERVAL);
+    // battery_measure_task_id = twr_scheduler_register(battery_measure_task, NULL, 2020);
 
-    // Initialize accelerometer
+    /* Initialize accelerometer
     twr_dice_init(&dice, TWR_DICE_FACE_UNKNOWN);
     twr_lis2dh12_init(&lis2dh12, TWR_I2C_I2C0, 0x19);
     twr_lis2dh12_set_resolution(&lis2dh12, TWR_LIS2DH12_RESOLUTION_8BIT);
     twr_lis2dh12_set_event_handler(&lis2dh12, lis2dh12_event_handler, NULL);
     twr_lis2dh12_set_update_interval(&lis2dh12, MEASURE_INTERVAL);
+    */
 
     // Initialize lora module
     twr_cmwx1zzabz_init(&lora, TWR_UART_UART1);
     twr_cmwx1zzabz_set_event_handler(&lora, lora_callback, NULL);
     twr_cmwx1zzabz_set_class(&lora, TWR_CMWX1ZZABZ_CONFIG_CLASS_A);
-
-    //Initialize CO2 module
-    twr_module_co2_init();
-    twr_module_co2_set_event_handler(co2_module_event_handler, NULL);
-    twr_module_co2_set_update_interval(MEASURE_INTERVAL_CO2);
 
     // Initialize AT command interface
     at_init(&ledg, &lora);
@@ -375,6 +637,9 @@ void application_init(void)
         TWR_ATCI_COMMAND_CLAC,
         TWR_ATCI_COMMAND_HELP};
     twr_atci_init(commands, TWR_ATCI_COMMANDS_LENGTH(commands));
+
+    twr_module_battery_measure();
+    twr_tag_humidity_measure(&humi);
 
     twr_scheduler_plan_current_relative(10 * 1000);
 }
@@ -400,14 +665,16 @@ void application_task(void)
 
     if (!isnan(voltage_avg))
     {
-        buffer[1] = ceil(voltage_avg * 10.f);
+        buffer[1] = ceil(voltage_avg * 30.f);
     }
 
-    int orientation;
+    float percentage_avg = NAN;
 
-    if (twr_data_stream_get_median(&sm_orientation, &orientation))
+    twr_data_stream_get_average(&sm_percentage, &percentage_avg);
+    if (!isnan(percentage_avg))
     {
-        buffer[2] = orientation;
+
+        buffer[2] = percentage_avg;
     }
 
     float temperature_avg = NAN;
@@ -453,7 +720,7 @@ void application_task(void)
 
     if (!isnan(voc_avg))
     {
-        uint16_t value = voc_avg / 2.f;
+        uint16_t value = (uint16_t)voc_avg;
         buffer[8] = value >> 8;
         buffer[9] = value;
     }
@@ -469,6 +736,8 @@ void application_task(void)
     twr_atci_printf("$SEND: %s\n", tmp);
 
     header = HEADER_UPDATE;
+
+    lcd_draw();
 
     twr_scheduler_plan_current_relative(SEND_DATA_INTERVAL);
 }
